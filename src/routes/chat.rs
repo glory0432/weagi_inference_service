@@ -19,7 +19,7 @@ pub fn add_routers(router: axum::Router<Arc<ServiceState>>) -> axum::Router<Arc<
             patch(chat::edit_message),
         )
         .route(
-            "/api/chat/conversation/:conversation_id/:title",
+            "/api/chat/conversation/:conversation_id/title",
             patch(chat::edit_title),
         )
         .route(

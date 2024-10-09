@@ -1,4 +1,4 @@
-use crate::dto::request::{EditMessageRequest, SendMessageRequest};
+use crate::dto::request::{EditMessageRequest, EditTitleRequest, SendMessageRequest};
 use crate::dto::response::{
     CreateNewConversationResponse, EditTitleResponse, GetConversationResponse,
     RetrieveAllConversationResponse,
@@ -184,14 +184,14 @@ pub async fn edit_message(
 
 pub async fn edit_title(
     Path(conversation_id): Path<Uuid>,
-    Path(title): Path<String>,
     State(state): State<Arc<ServiceState>>,
     user: UserClaims,
+    Json(req): Json<EditTitleRequest>,
 ) -> AppResult<impl IntoResponse> {
-    info!("📥 Edit the title of conversation request from user {} within conversation {} by the title {}", user.uid, conversation_id, title);
+    info!("📥 Edit the title of conversation request from user {} within conversation {} by the title {}", user.uid, conversation_id, req.title);
     handle_transaction(&state.db, |transaction| {
         Box::pin(async move {
-            conversation::edit_title(transaction, user.uid, conversation_id, title.clone())
+            conversation::edit_title(transaction, user.uid, conversation_id, req.title)
                 .await
                 .map_err(|e| format_error("Failed to edit title", e))?;
 

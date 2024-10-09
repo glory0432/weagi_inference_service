@@ -12,3 +12,8 @@ pub struct EditMessageRequest {
     pub user_message: String,
     pub model_name: String,
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EditTitleRequest {
+    pub title:  String,
+}
