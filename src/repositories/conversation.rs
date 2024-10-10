@@ -1,6 +1,5 @@
 use crate::entity::conversation;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set};
-use tracing::info;
 use uuid::Uuid;
 
 pub async fn new_conversation(tx: &DatabaseTransaction, user_id: i64) -> Result<Uuid, String> {
@@ -19,17 +18,6 @@ pub async fn new_conversation(tx: &DatabaseTransaction, user_id: i64) -> Result<
         )),
     }
 }
-
-// pub async fn find_by_id(
-//     tx: &DatabaseTransaction,
-//     id: Uuid,
-// ) -> Result<Option<conversation::Model>, String> {
-//     match conversation::Entity::find_by_id(id).one(tx).await {
-//         Ok(Some(model)) => Ok(Some(model)),
-//         Ok(None) => Err(format!("No conversation record found with id: {}", id)),
-//         Err(e) => Err(format!("Error finding conversation by id: {}", e)),
-//     }
-// }
 
 pub async fn find_by_user_id(
     tx: &DatabaseTransaction,
@@ -104,7 +92,6 @@ pub async fn add_message(
         } else {
             conversation_title = first_three_words;
         };
-        info!("updated title: {}", conversation_title);
     }
     updated_conversation.push(user_message);
     updated_conversation.push(answer);
@@ -153,15 +140,3 @@ pub async fn edit_title(
         Err(e) => Err(format!("Error updating the conversation title: {}", e)),
     }
 }
-
-// pub async fn exist_by_user_id(tx: &DatabaseTransaction, user_id: i64) -> Result<bool, String> {
-//     match conversation::Entity::find()
-//         .filter(conversation::Column::UserId.eq(user_id))
-//         .one(tx)
-//         .await
-//     {
-//         Ok(Some(_)) => Ok(true),
-//         Ok(None) => Ok(false),
-//         Err(e) => Err(format!("Error checking existence by user_id: {}", e)),
-//     }
-// }

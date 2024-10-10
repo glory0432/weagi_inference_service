@@ -27,15 +27,19 @@ async fn main() -> Result<(), String> {
     subscribe_tracing();
 
     let mut service_config = config::ServiceConfig::default();
-    service_config.init_from_env()?;
+    service_config.init_from_env().map_err(|e| {
+        error!("💥 Error in loading configuration from env: {}", e);
+        e
+    })?;
+    info!("✔ Configuration data is loaded!");
 
     let db_client = DatabaseClient::build_from_config(&service_config)
         .await
         .map_err(|e| {
-            println!("💥 Error in database connection: {}", e);
+            error!("💥 Error in database connection: {}", e);
             "Failed to build database client" // Provide a descriptive error message
         })?;
-    info!("📅 Connected to the database!");
+    info!("✔ Connected to the database!");
 
     let service_state = Arc::new(ServiceState {
         config: Arc::new(service_config.clone()),

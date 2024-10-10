@@ -35,7 +35,7 @@ impl UserClaims {
             &DECODE_HEADER,
         )
     }
-    pub async fn check_session(&mut self, auth_uri: &str, token: &str) -> Result<bool, String> {
+    async fn check_session(&mut self, auth_uri: &str, token: &str) -> Result<bool, String> {
         let client = reqwest::Client::new();
         self.token = Some(token.to_string());
         match client
@@ -76,15 +76,22 @@ impl FromRequestParts<Arc<ServiceState>> for UserClaims {
             .extract::<TypedHeader<Authorization<Bearer>>>()
             .await
             .map_err(|_| {
+                error!("Failed to extract authorization header for jwt token");
                 (
                     StatusCode::UNAUTHORIZED,
-                    "Invalid authorization header".to_string(),
+                    "Failed to extract authorization header for jwt token".to_string(),
                 )
             })?;
 
         let mut user_claims =
             UserClaims::decode(bearer.token(), &state.config.jwt.access_token_secret)
-                .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?
+                .map_err(|_| {
+                    error!("Failed to decode jwt token");
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "Failed to decode jwt token".to_string(),
+                    )
+                })?
                 .claims;
 
         if user_claims
@@ -97,6 +104,7 @@ impl FromRequestParts<Arc<ServiceState>> for UserClaims {
             })?
             == false
         {
+            error!("Invalid authorization header");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "Invalid authorization header".to_string(),

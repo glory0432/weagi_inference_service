@@ -1,4 +1,3 @@
-use crate::config::constant;
 use crate::dto::request::{EditMessageRequest, EditTitleRequest, SendMessageRequest};
 use crate::dto::response::{
     CreateNewConversationResponse, DeleteConversationResponse, EditTitleResponse,
@@ -30,7 +29,7 @@ where
     let mut transaction = db
         .begin()
         .await
-        .map_err(|e| format_error("Failed to start a database transaction", e))?;
+        .map_err(|e| format_error("Starting a database transaction failed", e))?;
 
     let result = operation(&mut transaction).await;
 
@@ -39,12 +38,15 @@ where
             transaction
                 .commit()
                 .await
-                .map_err(|e| format_error("Failed to commit transaction", e))?;
+                .map_err(|e| format_error("Committing the database transaction failed", e))?;
             Ok(response)
         }
         Err(e) => {
             if let Err(rollback_err) = transaction.rollback().await {
-                error!("Failed to rollback transaction: {}", rollback_err);
+                error!(
+                    "Rolling back the database transaction failed. Possible data inconsistency: {}",
+                    rollback_err
+                );
             }
             Err(e)
         }
@@ -53,7 +55,7 @@ where
 
 fn format_error(message: &str, error: impl std::fmt::Display) -> (StatusCode, String) {
     let error_message = format!("{}: {}", message, error);
-    error!("{}", error_message);
+    error!("Error occurred: {}", error_message);
     (StatusCode::INTERNAL_SERVER_ERROR, error_message)
 }
 
@@ -61,14 +63,26 @@ pub async fn create_new_conversation(
     State(state): State<Arc<ServiceState>>,
     user: UserClaims,
 ) -> AppResult<impl IntoResponse> {
-    info!("📥 Create new conversation request from user {}", user.uid);
+    info!(
+        "Initiating process to create a new conversation for user with ID '{}'.",
+        user.uid
+    );
 
     handle_transaction(&state.db, |transaction| {
         Box::pin(async move {
             let conversation_id = conversation::new_conversation(transaction, user.uid)
                 .await
-                .map_err(|e| format_error("Failed to create a new conversation", e))?;
+                .map_err(|e| {
+                    format_error(
+                        "Failed to create a new conversation due to a database error",
+                        e,
+                    )
+                })?;
 
+            info!(
+                "Successfully created new conversation with ID '{}' for user '{}'.",
+                conversation_id, user.uid
+            );
             Ok(Json(CreateNewConversationResponse { conversation_id }).into_response())
         })
     })
@@ -80,7 +94,7 @@ pub async fn retrieve_all_conversations(
     user: UserClaims,
 ) -> AppResult<impl IntoResponse> {
     info!(
-        "📥 Retrieve all conversation request from user {}",
+        "Retrieving all conversations for user with ID '{}'.",
         user.uid
     );
     handle_transaction(&state.db, |transaction| {
@@ -88,11 +102,21 @@ pub async fn retrieve_all_conversations(
             let conversation_list: Vec<(Uuid, String)> =
                 conversation::find_by_user_id(transaction, user.uid)
                     .await
-                    .map_err(|e| format_error("Failed to fetch all conversation content", e))?
+                    .map_err(|e| {
+                        format_error(
+                            "Failed to fetch user's conversations due to a database error",
+                            e,
+                        )
+                    })?
                     .into_iter()
                     .map(|x| (x.id, x.title))
                     .collect();
 
+            info!(
+                "Successfully retrieved {} conversations for user '{}'.",
+                conversation_list.len(),
+                user.uid
+            );
             Ok(Json(RetrieveAllConversationResponse { conversation_list }).into_response())
         })
     })
@@ -105,7 +129,7 @@ pub async fn delete_conversation(
     user: UserClaims,
 ) -> AppResult<impl IntoResponse> {
     info!(
-        "📥 Delete the conversation request from user {} within conversation {}",
+        "User with ID '{}' is attempting to delete conversation with ID '{}'.",
         user.uid, conversation_id
     );
     handle_transaction(&state.db, |transaction| {
@@ -116,11 +140,16 @@ pub async fn delete_conversation(
                 conversation_id,
             )
             .await
-            .map_err(|e| format_error("Failed to fetch the conversation content", e))?;
+            .map_err(|e| {
+                format_error(
+                    "Database query failed while fetching the specified conversation",
+                    e,
+                )
+            })?;
 
             if conversation_model.is_none() {
-                let error_message = format!("The conversation is not found");
-                error!("{}", error_message);
+                let error_message = "Conversation could not be found for deletion".to_string();
+                error!("Failed to delete: {}", error_message);
                 return Err((StatusCode::NOT_FOUND, error_message));
             }
 
@@ -128,10 +157,19 @@ pub async fn delete_conversation(
                 .unwrap()
                 .delete(transaction)
                 .await
-                .map_err(|e| format_error("Failed to delete the conversation", e))?;
+                .map_err(|e| {
+                    format_error(
+                        "Failed to delete the conversation due to a database error",
+                        e,
+                    )
+                })?;
 
+            info!(
+                "Conversation with ID '{}' successfully deleted by user '{}'.",
+                conversation_id, user.uid
+            );
             Ok(Json(DeleteConversationResponse {
-                message: "success".to_string(),
+                message: "Conversation successfully deleted".to_string(),
             })
             .into_response())
         })
@@ -145,7 +183,7 @@ pub async fn get_conversation(
     user: UserClaims,
 ) -> AppResult<impl IntoResponse> {
     info!(
-        "📥 Get the conversation request from user {} within conversation {}",
+        "User with ID '{}' is requesting details for conversation with ID '{}'.",
         user.uid, conversation_id
     );
     handle_transaction(&state.db, |transaction| {
@@ -156,20 +194,24 @@ pub async fn get_conversation(
                 conversation_id,
             )
             .await
-            .map_err(|e| format_error("Failed to fetch the conversation content", e))?;
+            .map_err(|e| {
+                format_error("Error fetching conversation details from the database", e)
+            })?;
 
-            let response = if let Some(model) = conversation_model {
-                Json(GetConversationResponse {
+            if let Some(model) = conversation_model {
+                info!(
+                    "Successfully retrieved details for conversation with ID '{}' for user '{}'.",
+                    conversation_id, user.uid
+                );
+                Ok(Json(GetConversationResponse {
                     messages: model.conversation,
                 })
-                .into_response()
+                .into_response())
             } else {
-                let error_message = format!("The conversation is not found");
-                error!("{}", error_message);
-                return Err((StatusCode::NOT_FOUND, error_message));
-            };
-
-            Ok(response)
+                let error_message = "Requested conversation could not be found".to_string();
+                error!("Failed to retrieve: {}", error_message);
+                Err((StatusCode::NOT_FOUND, error_message))
+            }
         })
     })
     .await
@@ -182,45 +224,19 @@ pub async fn send_message(
     Json(req): Json<SendMessageRequest>,
 ) -> AppResult<impl IntoResponse> {
     info!(
-        "📥 Send the message request from user {} within conversation {}",
-        user.uid, conversation_id
+        "User '{}' is attempting to send a message to conversation '{}'. Message: '{}', Model: '{}'.",
+        user.uid, conversation_id, req.user_message, req.model_name
     );
-    info!(
-        "🧾 Message: {}, Model name: {}",
-        req.user_message, req.model_name
-    );
-
-    if user.session_data.is_none() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Session data is missing".to_string(),
-        ));
-    }
-    if user.token.is_none() {
-        return Err((StatusCode::UNAUTHORIZED, "JWT token is missing".to_string()));
-    }
-    let mut remaining: f64 = 0.0;
-    if let Some(&cost) = constant::MODEL_TO_PRICE.get(req.model_name.as_str()) {
-        if cost > user.session_data.clone().unwrap().credits_remaining {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Not enough credit remains".to_string(),
-            ));
-        }
-        remaining = user.session_data.clone().unwrap().credits_remaining - cost;
-    } else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid model name".to_string()));
-    }
 
     save_message(
         state.clone(),
         user.uid,
+        user.session_data,
+        user.token,
         conversation_id,
         req.user_message,
         req.model_name,
         -1,
-        remaining,
-        user.token.unwrap(),
     )
     .await
 }
@@ -232,45 +248,18 @@ pub async fn edit_message(
     Json(req): Json<EditMessageRequest>,
 ) -> AppResult<impl IntoResponse> {
     info!(
-        "📥 Edit the message request from user {} within conversation {}",
-        user.uid, conversation_id
+        "User '{}' requested to edit message with ID '{}' in conversation '{}'. New content: '{}', Model: '{}'.",  
+        user.uid, req.message_id, conversation_id, req.user_message, req.model_name
     );
-    info!(
-        "🧾 Message: {}, Model name: {}, Message id: {}",
-        req.user_message, req.model_name, req.message_id
-    );
-
-    if user.session_data.is_none() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Session data is missing".to_string(),
-        ));
-    }
-    if user.token.is_none() {
-        return Err((StatusCode::UNAUTHORIZED, "JWT token is missing".to_string()));
-    }
-    let mut remaining: f64 = 0.0;
-    if let Some(&cost) = constant::MODEL_TO_PRICE.get(req.model_name.as_str()) {
-        if cost > user.session_data.clone().unwrap().credits_remaining {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Not enough credit remains".to_string(),
-            ));
-        }
-        remaining = user.session_data.clone().unwrap().credits_remaining - cost;
-    } else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid model name".to_string()));
-    }
-
     save_message(
         state.clone(),
         user.uid,
+        user.session_data,
+        user.token,
         conversation_id,
         req.user_message,
         req.model_name,
         req.message_id as i64,
-        remaining,
-        user.token.unwrap(),
     )
     .await
 }
@@ -281,15 +270,24 @@ pub async fn edit_title(
     user: UserClaims,
     Json(req): Json<EditTitleRequest>,
 ) -> AppResult<impl IntoResponse> {
-    info!("📥 Edit the title of conversation request from user {} within conversation {} by the title {}", user.uid, conversation_id, req.title);
+    info!(
+        "User '{}' is editing the title of conversation '{}' to '{}'.",
+        user.uid, conversation_id, req.title
+    );
     handle_transaction(&state.db, |transaction| {
         Box::pin(async move {
-            conversation::edit_title(transaction, user.uid, conversation_id, req.title)
+            conversation::edit_title(transaction, user.uid, conversation_id, req.title.clone())
                 .await
-                .map_err(|e| format_error("Failed to edit title", e))?;
+                .map_err(|e| {
+                    format_error("Error updating the conversation title in the database", e)
+                })?;
 
+            info!(
+                "Successfully updated title for conversation with ID '{}' to '{}'.",
+                conversation_id, req.title
+            );
             Ok(Json(EditTitleResponse {
-                message: "success".to_string(),
+                message: "Title successfully updated".to_string(),
             })
             .into_response())
         })
