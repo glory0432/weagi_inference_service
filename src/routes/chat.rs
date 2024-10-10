@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::controllers::chat;
 use crate::ServiceState;
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 
 pub fn add_routers(router: axum::Router<Arc<ServiceState>>) -> axum::Router<Arc<ServiceState>> {
     router
@@ -17,6 +17,10 @@ pub fn add_routers(router: axum::Router<Arc<ServiceState>>) -> axum::Router<Arc<
         .route(
             "/api/chat/conversation/:conversation_id",
             patch(chat::edit_message),
+        )
+        .route(
+            "/api/chat/conversation/:conversation_id",
+            delete(chat::delete_conversation),
         )
         .route(
             "/api/chat/conversation/:conversation_id/title",

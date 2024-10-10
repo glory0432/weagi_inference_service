@@ -13,7 +13,10 @@ pub async fn new_conversation(tx: &DatabaseTransaction, user_id: i64) -> Result<
 
     match new_conversation.insert(tx).await {
         Ok(user) => Ok(user.id),
-        Err(e) => Err(format!("New conversation record is not saved successfully: {}", e)),
+        Err(e) => Err(format!(
+            "New conversation record is not saved successfully: {}",
+            e
+        )),
     }
 }
 
@@ -54,7 +57,10 @@ pub async fn find_by_user_id_and_conversation_id(
         .await
     {
         Ok(model) => Ok(model),
-        Err(e) => Err(format!("Error finding conversation by user_id and conversation_id: {}", e)),
+        Err(e) => Err(format!(
+            "Error finding conversation by user_id and conversation_id: {}",
+            e
+        )),
     }
 }
 

@@ -1,9 +1,9 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionData {
-    pub credits_remaining: i32,
+    pub credits_remaining: f64,
     pub preferences: serde_json::Value,
     pub session_metadata: serde_json::Value,
     pub subscription_status: bool,
@@ -26,5 +26,10 @@ pub struct CreateNewConversationResponse {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EditTitleResponse {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeleteConversationResponse {
     pub message: String,
 }

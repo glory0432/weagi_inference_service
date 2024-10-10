@@ -15,5 +15,5 @@ pub struct EditMessageRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EditTitleRequest {
-    pub title:  String,
+    pub title: String,
 }

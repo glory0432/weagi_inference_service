@@ -5,6 +5,8 @@ use std::net::{AddrParseError, SocketAddr};
 pub struct ServerConfig {
     pub addr: String,
     pub port: u16,
+    pub auth_service: String,
+    pub auth_secret_key: String,
 }
 
 impl ServerConfig {
@@ -23,6 +25,12 @@ impl ServerConfig {
     pub fn init_from_env(&mut self) -> Result<(), String> {
         self.addr = env::var("SERVER_ADDR")
             .map_err(|_| "SERVER_ADDR not set in environment".to_string())?;
+
+        self.auth_service = env::var("AUTH_SERVICE_URL")
+            .map_err(|_| "AUTH_SERVICE_URL not set in environment".to_string())?;
+
+        self.auth_secret_key = env::var("INTERNAL_SERVER_KEY")
+            .map_err(|_| "INTERNAL_SERVER_KEY not set in environment".to_string())?;
 
         self.port = env::var("SERVER_PORT")
             .map_err(|_| "SERVER_PORT not set in environment".to_string())?

@@ -1,3 +1,4 @@
+pub mod constant;
 pub mod db;
 pub mod jwt;
 pub mod openai;

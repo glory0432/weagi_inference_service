@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::repositories::conversation;
+use crate::utils::session::send_session_data;
 use crate::ServiceState;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
@@ -10,6 +11,7 @@ use rs_openai::{
     OpenAI,
 };
 use sea_orm::TransactionTrait;
+use serde_json::json;
 use tokio::sync::oneshot;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt as _};
 use tracing::error;
@@ -22,6 +24,8 @@ pub async fn save_message(
     user_message: String,
     model_name: String,
     message_id: i64,
+    credits_remaining: f64,
+    token: String,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let transaction = state.db.begin().await.map_err(|e| {
         let error_message = format!("Failed to start a database transaction: {}", e);
@@ -163,6 +167,16 @@ pub async fn save_message(
             "Transaction handling failed".into(),
         )
     })? {
+        send_session_data(
+            json!({
+                "credits_remaining" : credits_remaining
+            }),
+            state.config.server.auth_service.as_str(),
+            state.config.server.auth_secret_key.clone(),
+            token,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let body = UnboundedReceiverStream::new(receiver);
         let sse = Sse::new(body).into_response();
         Ok(sse)

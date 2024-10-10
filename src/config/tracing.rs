@@ -8,6 +8,10 @@ pub fn subscribe_tracing() {
                 .with_line_number(true)
                 .with_thread_ids(true),
         )
-        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()).add_directive("sqlx=off".parse().unwrap()))
+        .with(
+            EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
+                .add_directive("sqlx=off".parse().unwrap()),
+        )
         .init();
 }

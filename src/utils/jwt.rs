@@ -1,4 +1,4 @@
-use crate::ServiceState;
+use crate::{dto::response::SessionData, ServiceState};
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
@@ -12,16 +12,19 @@ use jsonwebtoken::{DecodingKey, TokenData, Validation};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::error;
 use uuid::Uuid;
 
 pub static DECODE_HEADER: Lazy<Validation> = Lazy::new(|| Validation::default());
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserClaims {
     pub iat: i64,
     pub exp: i64,
     pub uid: i64,
     pub sid: Uuid,
+    pub session_data: Option<SessionData>,
+    pub token: Option<String>,
 }
 
 impl UserClaims {
@@ -32,8 +35,32 @@ impl UserClaims {
             &DECODE_HEADER,
         )
     }
-    pub fn check_session(&self) -> bool {
-        return true;
+    pub async fn check_session(&mut self, auth_uri: &str, token: &str) -> Result<bool, String> {
+        let client = reqwest::Client::new();
+        self.token = Some(token.to_string());
+        match client
+            .get(&format!("{}/session", auth_uri))
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<SessionData>().await {
+                        Ok(session_data) => {
+                            self.session_data = Some(session_data);
+                            return Ok(true);
+                        }
+                        Err(e) => Err(format!("Failed to parse session data: {}", e)),
+                    }
+                } else {
+                    return Ok(false);
+                }
+            }
+            Err(e) => {
+                return Err(format!("Check session failed: {}", e));
+            }
+        }
     }
 }
 
@@ -55,11 +82,21 @@ impl FromRequestParts<Arc<ServiceState>> for UserClaims {
                 )
             })?;
 
-        let user_claims = UserClaims::decode(bearer.token(), &state.config.jwt.access_token_secret)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?
-            .claims;
+        let mut user_claims =
+            UserClaims::decode(bearer.token(), &state.config.jwt.access_token_secret)
+                .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?
+                .claims;
 
-        if user_claims.check_session() == false {
+        if user_claims
+            .check_session(state.config.server.auth_service.as_str(), bearer.token())
+            .await
+            .map_err(|e| {
+                let error_message = format!("Failed to check session: {}", e);
+                error!("{}", error_message);
+                (StatusCode::INTERNAL_SERVER_ERROR, error_message)
+            })?
+            == false
+        {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "Invalid authorization header".to_string(),

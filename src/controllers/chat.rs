@@ -1,7 +1,8 @@
+use crate::config::constant;
 use crate::dto::request::{EditMessageRequest, EditTitleRequest, SendMessageRequest};
 use crate::dto::response::{
-    CreateNewConversationResponse, EditTitleResponse, GetConversationResponse,
-    RetrieveAllConversationResponse,
+    CreateNewConversationResponse, DeleteConversationResponse, EditTitleResponse,
+    GetConversationResponse, RetrieveAllConversationResponse,
 };
 use crate::repositories::conversation;
 use crate::service::chat::save_message;
@@ -14,7 +15,7 @@ use axum::{
     Json,
 };
 use futures::future::BoxFuture;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, ModelTrait, TransactionTrait};
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -98,6 +99,46 @@ pub async fn retrieve_all_conversations(
     .await
 }
 
+pub async fn delete_conversation(
+    Path(conversation_id): Path<Uuid>,
+    State(state): State<Arc<ServiceState>>,
+    user: UserClaims,
+) -> AppResult<impl IntoResponse> {
+    info!(
+        "📥 Delete the conversation request from user {} within conversation {}",
+        user.uid, conversation_id
+    );
+    handle_transaction(&state.db, |transaction| {
+        Box::pin(async move {
+            let conversation_model = conversation::find_by_user_id_and_conversation_id(
+                transaction,
+                user.uid,
+                conversation_id,
+            )
+            .await
+            .map_err(|e| format_error("Failed to fetch the conversation content", e))?;
+
+            if conversation_model.is_none() {
+                let error_message = format!("The conversation is not found");
+                error!("{}", error_message);
+                return Err((StatusCode::NOT_FOUND, error_message));
+            }
+
+            conversation_model
+                .unwrap()
+                .delete(transaction)
+                .await
+                .map_err(|e| format_error("Failed to delete the conversation", e))?;
+
+            Ok(Json(DeleteConversationResponse {
+                message: "success".to_string(),
+            })
+            .into_response())
+        })
+    })
+    .await
+}
+
 pub async fn get_conversation(
     Path(conversation_id): Path<Uuid>,
     State(state): State<Arc<ServiceState>>,
@@ -123,7 +164,9 @@ pub async fn get_conversation(
                 })
                 .into_response()
             } else {
-                Json(GetConversationResponse::default()).into_response()
+                let error_message = format!("The conversation is not found");
+                error!("{}", error_message);
+                return Err((StatusCode::NOT_FOUND, error_message));
             };
 
             Ok(response)
@@ -146,6 +189,29 @@ pub async fn send_message(
         "🧾 Message: {}, Model name: {}",
         req.user_message, req.model_name
     );
+
+    if user.session_data.is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Session data is missing".to_string(),
+        ));
+    }
+    if user.token.is_none() {
+        return Err((StatusCode::UNAUTHORIZED, "JWT token is missing".to_string()));
+    }
+    let mut remaining: f64 = 0.0;
+    if let Some(&cost) = constant::MODEL_TO_PRICE.get(req.model_name.as_str()) {
+        if cost > user.session_data.clone().unwrap().credits_remaining {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Not enough credit remains".to_string(),
+            ));
+        }
+        remaining = user.session_data.clone().unwrap().credits_remaining - cost;
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Invalid model name".to_string()));
+    }
+
     save_message(
         state.clone(),
         user.uid,
@@ -153,6 +219,8 @@ pub async fn send_message(
         req.user_message,
         req.model_name,
         -1,
+        remaining,
+        user.token.unwrap(),
     )
     .await
 }
@@ -171,6 +239,29 @@ pub async fn edit_message(
         "🧾 Message: {}, Model name: {}, Message id: {}",
         req.user_message, req.model_name, req.message_id
     );
+
+    if user.session_data.is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Session data is missing".to_string(),
+        ));
+    }
+    if user.token.is_none() {
+        return Err((StatusCode::UNAUTHORIZED, "JWT token is missing".to_string()));
+    }
+    let mut remaining: f64 = 0.0;
+    if let Some(&cost) = constant::MODEL_TO_PRICE.get(req.model_name.as_str()) {
+        if cost > user.session_data.clone().unwrap().credits_remaining {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Not enough credit remains".to_string(),
+            ));
+        }
+        remaining = user.session_data.clone().unwrap().credits_remaining - cost;
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Invalid model name".to_string()));
+    }
+
     save_message(
         state.clone(),
         user.uid,
@@ -178,6 +269,8 @@ pub async fn edit_message(
         req.user_message,
         req.model_name,
         req.message_id as i64,
+        remaining,
+        user.token.unwrap(),
     )
     .await
 }
