@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionData {
-    pub credits_remaining: f64,
+    pub credits_remaining: i64,
     pub preferences: serde_json::Value,
     pub session_metadata: serde_json::Value,
     pub subscription_status: bool,

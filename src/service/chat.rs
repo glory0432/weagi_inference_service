@@ -23,7 +23,6 @@ pub async fn save_message(
     state: Arc<ServiceState>,
     user_id: i64,
     session_data: Option<SessionData>,
-    token: Option<String>,
     conversation_id: Uuid,
     user_message: String,
     model_name: String,
@@ -39,23 +38,13 @@ pub async fn save_message(
             "Session data is required but missing. Please log in to continue.".to_string(),
         ));
     }
-    if token.is_none() {
-        error!(
-            "JWT token is missing for user '{}'. Token is required for authentication.",
-            user_id
-        );
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Valid JWT token is required but missing.".to_string(),
-        ));
-    }
 
     info!(
         "User '{}' is attempting to send a message in the conversation '{}'. Model used: '{}'",
         user_id, conversation_id, model_name
     );
 
-    let credits_remaining: f64;
+    let credits_remaining: i64;
     if let Some(&cost) = constant::MODEL_TO_PRICE.get(model_name.as_str()) {
         credits_remaining = session_data.clone().unwrap().credits_remaining;
         if cost > credits_remaining {
@@ -268,11 +257,11 @@ pub async fn save_message(
     })? {
         send_session_data(
             json!({
-                "credits_remaining" : credits_remaining
+                "credits_remaining" : credits_remaining,
+                "user_id" : user_id
             }),
             state.config.server.auth_service.as_str(),
             state.config.server.auth_secret_key.clone(),
-            token.unwrap(),
         )
         .await
         .map_err(|e| {

@@ -9,7 +9,6 @@ pub async fn send_session_data(
     session_data: serde_json::Value,
     auth_uri: &str,
     secret_key: String,
-    token: String,
 ) -> Result<(), String> {
     let client = Client::new();
 
@@ -25,7 +24,6 @@ pub async fn send_session_data(
         .post(format!("{}/session", auth_uri))
         .header("X-Signature", BASE64_STANDARD.encode(&signature)) // Include signature in headers
         .header("Content-Type", "application/json")
-        .bearer_auth(token)
         .body(body)
         .send()
         .await
