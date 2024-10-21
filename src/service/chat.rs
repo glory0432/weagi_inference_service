@@ -1,13 +1,18 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::constant;
 use crate::dto::response::SessionData;
 use crate::repositories::conversation;
 use crate::utils::session::send_session_data;
 use crate::ServiceState;
+use axum::http::header::*;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
+use axum_streams::*;
+
+use futures::{stream, TryStreamExt};
 use rs_openai::{
     chat::{ChatCompletionMessageRequestBuilder, CreateChatRequestBuilder, Role},
     OpenAI,
@@ -151,7 +156,7 @@ pub async fn save_message(
         .build()
         .unwrap();
 
-    let mut stream = client
+    let mut openai_stream = client
         .chat()
         .create_with_stream(&chat_request)
         .await
@@ -161,131 +166,71 @@ pub async fn save_message(
             (StatusCode::INTERNAL_SERVER_ERROR, error_message)
         })?;
 
-    let (sender, receiver) =
-        tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+    let mut content_buffer = vec![];
+    let mut total_content = "".to_string();
 
-    let (result_tx, result_rx) = oneshot::channel();
-
-    tokio::spawn(async move {
-        let mut content_buffer = String::new();
-        let mut commit_transaction = true;
-
-        while let Some(response) = stream.next().await {
-            match response {
-                Ok(result) => {
-                    for choice in result.choices {
-                        if let Some(content) = choice.delta.content {
-                            content_buffer.push_str(&content); // Collect content
-                            if sender
-                                .send(Ok(Event::default().data(content.clone())))
-                                .is_err()
-                            {
-                                error!(
-                                    "Error: Failed to send event stream for conversation '{}'.",
-                                    conversation_id
-                                );
-                                commit_transaction = false;
-                                break;
-                            }
-                        }
+    while let Some(response) = openai_stream.next().await {
+        match response {
+            Ok(result) => {
+                for choice in result.choices {
+                    if let Some(content) = choice.delta.content {
+                        content_buffer.push(content.clone());
+                        total_content.push_str(content.as_str());
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Stream error occurred while processing OpenAI response for conversation '{}': {}",  
-                        conversation_id, e
-                    );
-                    commit_transaction = false;
-                    break;
-                }
+            }
+            Err(e) => {
+                let error_message = format!("Stream error occurred while processing OpenAI response for conversation '{}': {}", conversation_id, e);
+                error!(error_message);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, error_message));
             }
         }
-
-        if commit_transaction {
-            info!(
-                "Committing transaction for conversation '{}' and user '{}'.",
-                conversation_id, user_id
-            );
-            if let Err(e) = conversation::add_message(
-                &transaction,
-                user_id,
-                conversation_id,
-                user_message,
-                content_buffer,
-                if message_id == -1 {
-                    (conversation_list.len() - 1) as i64
-                } else {
-                    message_id * 2
-                },
-            )
-            .await
-            {
-                error!("Failed to save message in database: {}", e);
-                commit_transaction = false;
-            }
-        }
-
-        if commit_transaction {
-            if let Err(e) = transaction.commit().await {
-                error!(
-                    "Failed to commit transaction for conversation '{}': {}",
-                    conversation_id, e
-                );
-                commit_transaction = false;
-            }
+    }
+    conversation::add_message(
+        &transaction,
+        user_id,
+        conversation_id,
+        user_message,
+        total_content,
+        if message_id == -1 {
+            (conversation_list.len() - 1) as i64
         } else {
-            if let Err(e) = transaction.rollback().await {
-                error!(
-                    "Failed to rollback transaction for conversation '{}': {}",
-                    conversation_id, e
-                );
-            }
-        }
-
-        let _ = result_tx.send(commit_transaction);
-    });
-
-    if result_rx.await.map_err(|_| {
+            message_id * 2
+        },
+    )
+    .await
+    .map_err(|e| {
+        let error_message = format!("Failed to save message in database: {}", e);
+        error!("{}", error_message);
+        (StatusCode::INTERNAL_SERVER_ERROR, error_message)
+    })?;
+    send_session_data(
+        json!({
+            "credits_remaining" : credits_remaining,
+            "user_id" : user_id
+        }),
+        state.config.server.auth_service.as_str(),
+        state.config.server.auth_secret_key.clone(),
+    )
+    .await
+    .map_err(|e| {
         error!(
-            "Transaction handling failed for conversation '{}' and user '{}'.",
-            conversation_id, user_id
+            "Error sending updated session data for user '{}': {}",
+            user_id, e
         );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Transaction failed unexpectedly.".into(),
+            "Unable to update session data.".to_string(),
         )
-    })? {
-        send_session_data(
-            json!({
-                "credits_remaining" : credits_remaining,
-                "user_id" : user_id
-            }),
-            state.config.server.auth_service.as_str(),
-            state.config.server.auth_secret_key.clone(),
-        )
-        .await
-        .map_err(|e| {
-            error!(
-                "Error sending updated session data for user '{}': {}",
-                user_id, e
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Unable to update session data.".to_string(),
-            )
-        })?;
-        let body = UnboundedReceiverStream::new(receiver);
-        let sse = Sse::new(body).into_response();
-        Ok(sse)
-    } else {
-        error!(
-            "Transaction handling failed at the end of the process for conversation '{}' and user '{}'.",  
-            conversation_id, user_id
-        );
-
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Transaction processing completed with errors.".into(),
-        ))
-    }
+    })?;
+    let stream = stream::iter(content_buffer.clone());
+    let body = StreamBodyAs::text(stream);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    return Ok((headers, body));
 }

@@ -7,6 +7,7 @@ edition = "2021"
 async-trait = "0.1.83"
 axum = { version = "0.7.7", features = ["ws"] }
 axum-extra = { version = "0.9.4", features = ["typed-header"] }
+axum-streams = { version = "0.19.0", features = ["text"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.38", default-features = false, features = [
   "clock",
