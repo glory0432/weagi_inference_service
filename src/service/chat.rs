@@ -1,26 +1,34 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use crate::config::constant;
 use crate::dto::response::SessionData;
+use crate::entity::conversation::Message;
+use crate::entity::conversation::MessageType;
 use crate::repositories::conversation;
+use crate::utils::deepgram::speech_to_text;
+use crate::utils::file::save_file;
 use crate::utils::session::send_session_data;
 use crate::ServiceState;
-use axum::http::header::*;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum_streams::*;
+use axum::response::Response;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use http_body_util::StreamBody;
+use hyper::body::{Bytes, Frame};
+use image::ImageFormat;
+use image::ImageReader;
+use std::io::Cursor;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
-use futures::{stream, TryStreamExt};
 use rs_openai::{
     chat::{ChatCompletionMessageRequestBuilder, CreateChatRequestBuilder, Role},
     OpenAI,
 };
 use sea_orm::TransactionTrait;
 use serde_json::json;
-use tokio::sync::oneshot;
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt as _};
+use tokio_stream::StreamExt;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -29,9 +37,13 @@ pub async fn save_message(
     user_id: i64,
     session_data: Option<SessionData>,
     conversation_id: Uuid,
-    user_message: String,
-    model_name: String,
+    message_type: String,
+    message_data: Vec<u8>,
+    message_model: String,
+    images: Vec<Bytes>,
     message_id: i64,
+    voice_filename: Option<String>,
+    image_filnames: Vec<Option<String>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if session_data.is_none() {
         error!(
@@ -46,11 +58,27 @@ pub async fn save_message(
 
     info!(
         "User '{}' is attempting to send a message in the conversation '{}'. Model used: '{}'",
-        user_id, conversation_id, model_name
+        user_id, conversation_id, message_model
     );
 
     let credits_remaining: i64;
-    if let Some(&cost) = constant::MODEL_TO_PRICE.get(model_name.as_str()) {
+    let message_type = format!("\"{}\"", message_type);
+
+    let message_type: Result<MessageType, serde_json::Error> =
+        serde_json::from_str::<MessageType>(&message_type);
+    if message_type.is_err() {
+        error!(
+            "Failed to parse message type: {}",
+            message_type.unwrap_err()
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Failed to parse message type".to_string(),
+        ));
+    }
+    let message_type = message_type.unwrap();
+
+    if let Some(&cost) = constant::MODEL_TO_PRICE.get(message_model.as_str()) {
         credits_remaining = session_data.clone().unwrap().credits_remaining;
         if cost > credits_remaining {
             error!(
@@ -69,13 +97,30 @@ pub async fn save_message(
     } else {
         error!(
             "Invalid model name '{}' provided by user '{}'. Model not recognized.",
-            model_name, user_id
+            message_model, user_id
         );
         return Err((
             StatusCode::BAD_REQUEST,
             "The provided model name is invalid or not supported.".to_string(),
         ));
     }
+    let user_message = match message_type {
+        MessageType::Text => String::from_utf8(message_data.clone()).map_err(|e| {
+            let error_message = format!("Failed to convert message data into string: {}", e);
+            error!("{}", error_message);
+            (StatusCode::BAD_REQUEST, error_message)
+        })?,
+        _ => speech_to_text(
+            &state.config.deepgram.deepgram_key,
+            message_type.to_language(),
+            message_data.clone(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Speech to text error: {}", e);
+            (StatusCode::BAD_REQUEST, e)
+        })?,
+    };
 
     let transaction = state.db.begin().await.map_err(|e| {
         let error_message = format!(
@@ -130,28 +175,99 @@ pub async fn save_message(
         org_id: None,
     });
 
-    let mut conversation_list = conversation_model.clone().unwrap().conversation.clone();
-    conversation_list.push(user_message.clone());
+    let mut conversation_list: Vec<(String, Role, Vec<String>)> = conversation_model
+        .clone()
+        .unwrap()
+        .conversation
+        .clone()
+        .into_iter()
+        .map(|e| {
+            let message: Message = serde_json::from_value(e).unwrap();
+            match message.msgtype {
+                MessageType::Text => (message.content, message.role, message.images),
+                _ => (
+                    message.transcription.unwrap_or_default(),
+                    message.role,
+                    message.images,
+                ),
+            }
+        })
+        .collect();
+    let mut last_user_message_images = vec![];
+    for (index, image) in images.iter().enumerate() {
+        let saved_filename;
+        let mut file_extension: Option<&str> = None;
+        if let Some(ref filename) = image_filnames[index] {
+            file_extension = Path::new(filename.as_str())
+                .extension()
+                .and_then(std::ffi::OsStr::to_str);
+        }
+        if let Some(extension) = file_extension {
+            saved_filename = format!(
+                "images/{}-{}-{}.{}",
+                conversation_id,
+                conversation_list.len(),
+                index,
+                extension,
+            );
+        } else {
+            saved_filename = format!(
+                "images/{}-{}-{}",
+                conversation_id,
+                conversation_list.len(),
+                index
+            );
+        }
+        save_file(saved_filename.as_str(), image.to_vec().clone()).map_err(|e| {
+            let error_message = format!("Error in saving user's image file: {}", e);
+            error!("{}", error_message);
+            (StatusCode::INTERNAL_SERVER_ERROR, error_message)
+        })?;
+        last_user_message_images.push(format!("./public/{}", saved_filename));
+    }
+    conversation_list.push((user_message.clone(), Role::User, last_user_message_images));
 
     let chat_request = CreateChatRequestBuilder::default()
-        .model(model_name)
+        .model(message_model)
         .messages(
             conversation_list
                 .iter()
                 .enumerate()
-                .map(|(index, message)| {
+                .map(|(_, &(ref message, ref role, ref images))| {
+                    let mut content_items = vec![json!({
+                        "type": "text",
+                        "text": message.clone()
+                    })];
+
+                    for image in images {
+                        let img = ImageReader::open(image)
+                            .expect("Failed to open image")
+                            .decode()
+                            .expect("Failed to decode image");
+                        let mut jpeg_buffer = Vec::new();
+                        {
+                            let mut cursor = Cursor::new(&mut jpeg_buffer);
+                            img.write_to(&mut cursor, ImageFormat::Jpeg)
+                                .expect("Failed to convert image to JPEG");
+                        }
+                        let base64_string = BASE64_STANDARD.encode(&jpeg_buffer);
+                        content_items.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url" : format!("data:image/jpeg;base64,{}", base64_string)
+                            }
+                        }));
+                    }
+                    let content_value = serde_json::Value::Array(content_items);
                     ChatCompletionMessageRequestBuilder::default()
-                        .role(if index % 2 == 0 {
-                            Role::User
-                        } else {
-                            Role::Assistant
-                        })
-                        .content(message.clone())
+                        .role(role.clone())
+                        .content(content_value.to_string())
                         .build()
                         .unwrap()
                 })
                 .collect::<Vec<_>>(),
         )
+        .max_tokens(4098 as u32)
         .stream(true)
         .build()
         .unwrap();
@@ -168,69 +284,120 @@ pub async fn save_message(
 
     let mut content_buffer = vec![];
     let mut total_content = "".to_string();
-
-    while let Some(response) = openai_stream.next().await {
-        match response {
-            Ok(result) => {
-                for choice in result.choices {
-                    if let Some(content) = choice.delta.content {
-                        content_buffer.push(content.clone());
-                        total_content.push_str(content.as_str());
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, String>>(1000000);
+    tokio::spawn(async move {
+        while let Some(response) = openai_stream.next().await {
+            match response {
+                Ok(result) => {
+                    for choice in result.choices {
+                        if let Some(content) = choice.delta.content {
+                            let content_clone = content.clone();
+                            content_buffer.push(content.clone());
+                            if tx
+                                .send(Ok(Frame::data(Bytes::from(content_clone))))
+                                .await
+                                .is_err()
+                            {
+                                return Err(());
+                            }
+                            total_content.push_str(content.clone().as_str());
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                let error_message = format!("Stream error occurred while processing OpenAI response for conversation '{}': {}", conversation_id, e);
-                error!(error_message);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, error_message));
+                Err(e) => {
+                    let error_message = format!("Stream error occurred while processing OpenAI response for conversation '{}': {}", conversation_id, e);
+                    error!(error_message);
+                    let _ = tx.send(Err(error_message)).await;
+                    return Err(());
+                }
             }
         }
-    }
-    conversation::add_message(
-        &transaction,
-        user_id,
-        conversation_id,
-        user_message,
-        total_content,
-        if message_id == -1 {
-            (conversation_list.len() - 1) as i64
-        } else {
-            message_id * 2
-        },
-    )
-    .await
-    .map_err(|e| {
-        let error_message = format!("Failed to save message in database: {}", e);
-        error!("{}", error_message);
-        (StatusCode::INTERNAL_SERVER_ERROR, error_message)
-    })?;
-    send_session_data(
-        json!({
-            "credits_remaining" : credits_remaining,
-            "user_id" : user_id
-        }),
-        state.config.server.auth_service.as_str(),
-        state.config.server.auth_secret_key.clone(),
-    )
-    .await
-    .map_err(|e| {
-        error!(
-            "Error sending updated session data for user '{}': {}",
-            user_id, e
-        );
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Unable to update session data.".to_string(),
+        let mut saved_filename = String::from("");
+        let mut file_extension: Option<&str> = None;
+        if message_type != MessageType::Text {
+            if let Some(ref filename) = voice_filename {
+                file_extension = Path::new(filename.as_str())
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str);
+            }
+            if let Some(extension) = file_extension {
+                saved_filename = format!(
+                    "voice/{}-{}.{}",
+                    conversation_id,
+                    conversation_list.len() - 1,
+                    extension
+                );
+            } else {
+                saved_filename =
+                    format!("voice/{}-{}", conversation_id, conversation_list.len() - 1);
+            }
+            save_file(saved_filename.as_str(), message_data.clone()).unwrap();
+        }
+
+        if conversation::add_message(
+            &transaction,
+            user_id,
+            conversation_id,
+            message_type.clone(),
+            if message_type == MessageType::Text {
+                user_message.clone()
+            } else {
+                saved_filename
+            },
+            if message_type == MessageType::Text {
+                None
+            } else {
+                Some(user_message)
+            },
+            vec![],
+            total_content,
+            if message_id == -1 {
+                (conversation_list.len() - 1) as i64
+            } else {
+                message_id * 2
+            },
         )
-    })?;
-    let stream = stream::iter(content_buffer.clone());
-    let body = StreamBodyAs::text(stream);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Content-Type",
-        HeaderValue::from_static("text/event-stream"),
-    );
-    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
-    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-    return Ok((headers, body));
+        .await
+        .is_err()
+        {
+            let error_message = format!("Failed to save message in database");
+            error!("{}", error_message);
+            let _ = tx.send(Err(error_message)).await;
+            return Err(());
+        };
+
+        if send_session_data(
+            json!({
+                "credits_remaining" : credits_remaining,
+                "user_id" : user_id
+            }),
+            state.config.server.auth_service.as_str(),
+            state.config.server.auth_secret_key.clone(),
+        )
+        .await
+        .is_err()
+        {
+            let error_message =
+                format!("Error sending updated session data for user '{}'", user_id);
+            error!("{}", error_message);
+            let _ = tx.send(Err(error_message)).await;
+            return Err(());
+        };
+
+        if transaction.commit().await.is_err() {
+            let error_message = format!("Committing the database transaction failed");
+            error!("{error_message}");
+            let _ = tx.send(Err(error_message)).await;
+            return Err(());
+        };
+        Ok(())
+    });
+    let stream = ReceiverStream::new(rx);
+    let body_openai = StreamBody::new(stream);
+
+    return Ok(Response::builder()
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body_openai)
+        .unwrap());
 }

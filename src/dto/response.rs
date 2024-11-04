@@ -1,3 +1,5 @@
+use crate::entity::conversation::Message;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,12 +13,12 @@ pub struct SessionData {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GetConversationResponse {
-    pub messages: Vec<String>,
+    pub messages: Vec<Message>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RetrieveAllConversationResponse {
-    pub conversation_list: Vec<(Uuid, String)>,
+    pub conversation_list: Vec<(Uuid, String, DateTime<Utc>)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

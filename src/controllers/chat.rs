@@ -1,18 +1,19 @@
-use crate::dto::request::{EditMessageRequest, EditTitleRequest, SendMessageRequest};
+use crate::dto::request::EditTitleRequest;
 use crate::dto::response::{
     CreateNewConversationResponse, DeleteConversationResponse, EditTitleResponse,
     GetConversationResponse, RetrieveAllConversationResponse,
 };
+use crate::entity::conversation::Message;
 use crate::repositories::conversation;
 use crate::service::chat::save_message;
 use crate::utils::jwt::UserClaims;
 use crate::ServiceState;
 use axum::{
-    extract::{Path, State},
+    extract::{Json, Multipart, Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use sea_orm::{DatabaseConnection, ModelTrait, TransactionTrait};
 use std::sync::Arc;
@@ -99,7 +100,7 @@ pub async fn retrieve_all_conversations(
     );
     handle_transaction(&state.db, |transaction| {
         Box::pin(async move {
-            let conversation_list: Vec<(Uuid, String)> =
+            let conversation_list: Vec<(Uuid, String, DateTime<Utc>)> =
                 conversation::find_by_user_id(transaction, user.uid)
                     .await
                     .map_err(|e| {
@@ -109,7 +110,7 @@ pub async fn retrieve_all_conversations(
                         )
                     })?
                     .into_iter()
-                    .map(|x| (x.id, x.title))
+                    .map(|x| (x.id, x.title, x.updated_at))
                     .collect();
 
             info!(
@@ -203,8 +204,15 @@ pub async fn get_conversation(
                     "Successfully retrieved details for conversation with ID '{}' for user '{}'.",
                     conversation_id, user.uid
                 );
+                let message_result: Result<Vec<Message>, serde_json::Error> = model
+                    .conversation
+                    .into_iter()
+                    .map(|v| serde_json::from_value::<Message>(v))
+                    .collect();
+                let message_result = message_result
+                    .map_err(|e| format_error("Error converting to Message array", e))?;
                 Ok(Json(GetConversationResponse {
-                    messages: model.conversation,
+                    messages: message_result,
                 })
                 .into_response())
             } else {
@@ -221,11 +229,53 @@ pub async fn send_message(
     Path(conversation_id): Path<Uuid>,
     State(state): State<Arc<ServiceState>>,
     user: UserClaims,
-    Json(req): Json<SendMessageRequest>,
+    mut multipart: Multipart,
 ) -> AppResult<impl IntoResponse> {
+    let mut message_type = String::from("");
+    let mut message_data: Vec<u8> = vec![];
+    let mut message_model: String = String::from("");
+    let mut images = vec![];
+    let mut image_filenames = vec![];
+    let mut voice_filename: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| format_error("Failed to read multipart fields", e))?
+    {
+        let name = field.name();
+        if name.is_none() {
+            continue;
+        }
+        let filename = field.file_name().map(|s| s.to_string());
+        let name = name.unwrap().to_string();
+        let data = field.bytes().await;
+        if data.is_err() {
+            continue;
+        }
+        let data = data.unwrap();
+
+        if name == String::from("message_type") {
+            message_type = String::from_utf8(data.iter().as_slice().to_vec())
+                .map_err(|e| format_error("Error parsing message type as string", e))?;
+        } else if name == String::from("user_message") {
+            message_data = data.iter().as_slice().to_vec();
+            voice_filename = filename;
+        } else if name == String::from("model_name") {
+            message_model = String::from_utf8(data.iter().as_slice().to_vec())
+                .map_err(|e| format_error("Error parsing message model as string", e))?;
+        } else if name == String::from("images") {
+            image_filenames.push(filename);
+            images.push(data.clone());
+        }
+    }
+    if message_type.is_empty() || message_data.is_empty() || message_model.is_empty() {
+        let error_message = format!("Something is missing in the payload: (type existing){}, (data existing){}, (model existing){}", message_type.is_empty(), message_data.is_empty(), message_model.is_empty());
+        error!("{}", error_message);
+        return Err((StatusCode::BAD_REQUEST, error_message));
+    }
     info!(
-        "User '{}' is attempting to send a message to conversation '{}'. Message: '{}', Model: '{}'.",
-        user.uid, conversation_id, req.user_message, req.model_name
+        "User '{}' is attempting to send a message to conversation '{}'. Message type: {}, Message Model: {}",
+        user.uid, conversation_id, message_type, message_model
     );
 
     save_message(
@@ -233,9 +283,13 @@ pub async fn send_message(
         user.uid,
         user.session_data,
         conversation_id,
-        req.user_message,
-        req.model_name,
+        message_type,
+        message_data,
+        message_model,
+        images,
         -1,
+        voice_filename,
+        image_filenames,
     )
     .await
 }
@@ -244,20 +298,73 @@ pub async fn edit_message(
     Path(conversation_id): Path<Uuid>,
     State(state): State<Arc<ServiceState>>,
     user: UserClaims,
-    Json(req): Json<EditMessageRequest>,
+    mut multipart: Multipart,
 ) -> AppResult<impl IntoResponse> {
+    let mut message_type = String::from("");
+    let mut message_data: Vec<u8> = vec![];
+    let mut message_model: String = String::from("");
+    let mut message_id = 0 as i64;
+    let mut images = vec![];
+    let mut image_filenames = vec![];
+    let mut voice_filename: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| format_error("Failed to read multipart fields", e))?
+    {
+        let name = field.name();
+        if name.is_none() {
+            continue;
+        }
+        let filename = field.file_name().map(|s| s.to_string());
+        let name = name.unwrap().to_string();
+        let data = field.bytes().await;
+        if data.is_err() {
+            continue;
+        }
+        let data = data.unwrap();
+
+        if name == String::from("message_type") {
+            message_type = String::from_utf8(data.iter().as_slice().to_vec())
+                .map_err(|e| format_error("Error parsing message type as string", e))?;
+        } else if name == String::from("user_message") {
+            message_data = data.iter().as_slice().to_vec();
+            voice_filename = filename;
+        } else if name == String::from("message_id") {
+            message_id = String::from_utf8(data.iter().as_slice().to_vec())
+                .map_err(|e| format_error("Error parsing message id as string", e))?
+                .parse::<i64>()
+                .map_err(|e| format_error("Error parsing string as u32", e))?;
+        } else if name == String::from("model_name") {
+            message_model = String::from_utf8(data.iter().as_slice().to_vec())
+                .map_err(|e| format_error("Error parsing message model as string", e))?;
+        } else if name == String::from("images") {
+            image_filenames.push(filename);
+            images.push(data.clone());
+        }
+    }
+    if message_type.is_empty() || message_data.is_empty() || message_model.is_empty() {
+        let error_message = format!("Something is missing in the payload: (type existing){}, (data existing){}, (model existing){}", message_type.is_empty(), message_data.is_empty(), message_model.is_empty());
+        error!("{}", error_message);
+        return Err((StatusCode::BAD_REQUEST, error_message));
+    }
     info!(
-        "User '{}' requested to edit message with ID '{}' in conversation '{}'. New content: '{}', Model: '{}'.",  
-        user.uid, req.message_id, conversation_id, req.user_message, req.model_name
+        "User '{}' is attempting to send a message to conversation '{}'. Message type: {}, Message Model: {}",
+        user.uid, conversation_id, message_type, message_model
     );
+
     save_message(
         state.clone(),
         user.uid,
         user.session_data,
         conversation_id,
-        req.user_message,
-        req.model_name,
-        req.message_id as i64,
+        message_type,
+        message_data,
+        message_model,
+        images,
+        message_id,
+        voice_filename,
+        image_filenames,
     )
     .await
 }

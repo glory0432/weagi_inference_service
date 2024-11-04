@@ -1,5 +1,6 @@
 pub mod constant;
 pub mod db;
+pub mod deepgram;
 pub mod jwt;
 pub mod openai;
 pub mod server;
@@ -13,6 +14,7 @@ pub struct ServiceConfig {
     pub server: server::ServerConfig,
     pub jwt: jwt::JWTConfig,
     pub openai: openai::OpenAIConfig,
+    pub deepgram: deepgram::DeepgramConfig,
 }
 
 impl ServiceConfig {
@@ -22,6 +24,7 @@ impl ServiceConfig {
         self.server.init_from_env()?;
         self.jwt.init_from_env()?;
         self.openai.init_from_env()?;
+        self.deepgram.init_from_env()?;
         Ok(())
     }
 }

@@ -1,5 +1,9 @@
-use crate::entity::conversation;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set};
+use crate::entity::conversation::{self, Message, MessageType};
+use chrono::Utc;
+use rs_openai::chat::Role;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set,
+};
 use uuid::Uuid;
 
 pub async fn new_conversation(tx: &DatabaseTransaction, user_id: i64) -> Result<Uuid, String> {
@@ -8,6 +12,8 @@ pub async fn new_conversation(tx: &DatabaseTransaction, user_id: i64) -> Result<
         user_id: Set(user_id),
         conversation: Set(vec![]),
         title: Set(String::from("New Chat")),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
     };
 
     match new_conversation.insert(tx).await {
@@ -25,6 +31,7 @@ pub async fn find_by_user_id(
 ) -> Result<Vec<conversation::Model>, String> {
     match conversation::Entity::find()
         .filter(conversation::Column::UserId.eq(user_id))
+        .order_by(conversation::Column::UpdatedAt, sea_orm::Order::Desc)
         .all(tx)
         .await
     {
@@ -56,7 +63,10 @@ pub async fn add_message(
     tx: &DatabaseTransaction,
     user_id: i64,
     conversation_id: Uuid,
+    user_message_type: MessageType,
     user_message: String,
+    transcription: Option<String>,
+    images: Vec<String>,
     answer: String,
     message_id: i64,
 ) -> Result<conversation::Model, String> {
@@ -93,14 +103,36 @@ pub async fn add_message(
             conversation_title = first_three_words;
         };
     }
-    updated_conversation.push(user_message);
-    updated_conversation.push(answer);
+    updated_conversation.push(
+        serde_json::to_value(&Message {
+            msgtype: user_message_type,
+            id: updated_conversation.len() + 1,
+            role: Role::User,
+            content: user_message,
+            transcription: transcription,
+            images: images,
+        })
+        .map_err(|e| format!("Error to converting JSON Value from Message: {}", e))?,
+    );
+    updated_conversation.push(
+        serde_json::to_value(&Message {
+            msgtype: MessageType::Text,
+            id: updated_conversation.len(),
+            role: Role::Assistant,
+            transcription: None,
+            content: answer,
+            images: vec![],
+        })
+        .map_err(|e| format!("Error to converting JSON Value from Message: {}", e))?,
+    );
 
     let updated_model = conversation::ActiveModel {
         id: Set(conversation_model.id),
         user_id: Set(conversation_model.user_id),
         conversation: Set(updated_conversation),
         title: Set(conversation_title.clone()),
+        created_at: Set(conversation_model.created_at),
+        updated_at: Set(Utc::now()),
     };
 
     match updated_model.update(tx).await {
@@ -133,6 +165,8 @@ pub async fn edit_title(
         user_id: Set(conversation_model.user_id),
         conversation: Set(conversation_model.conversation),
         title: Set(title),
+        created_at: Set(conversation_model.created_at),
+        updated_at: Set(Utc::now()),
     };
 
     match updated_model.update(tx).await {
