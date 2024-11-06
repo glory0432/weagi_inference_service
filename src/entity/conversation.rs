@@ -8,21 +8,11 @@ use uuid::Uuid; // Importing Uuid
 #[serde(rename_all = "kebab-case")]
 pub enum MessageType {
     Text,
-    VoiceRu,
-    VoiceEn,
+    Voice,
 }
 impl Default for MessageType {
     fn default() -> Self {
         MessageType::Text
-    }
-}
-impl MessageType {
-    pub fn to_language(&self) -> &str {
-        match self {
-            MessageType::VoiceRu => "ru",
-            MessageType::VoiceEn => "en",
-            _ => "",
-        }
     }
 }
 

@@ -5,7 +5,7 @@ use crate::dto::response::{
 };
 use crate::entity::conversation::Message;
 use crate::repositories::conversation;
-use crate::service::chat::save_message;
+use crate::service::chat::handle_user_message;
 use crate::utils::jwt::UserClaims;
 use crate::ServiceState;
 use axum::{
@@ -278,7 +278,7 @@ pub async fn send_message(
         user.uid, conversation_id, message_type, message_model
     );
 
-    save_message(
+    handle_user_message(
         state.clone(),
         user.uid,
         user.session_data,
@@ -353,7 +353,7 @@ pub async fn edit_message(
         user.uid, conversation_id, message_type, message_model
     );
 
-    save_message(
+    handle_user_message(
         state.clone(),
         user.uid,
         user.session_data,

@@ -3,36 +3,61 @@ use crate::dto::response::SessionData;
 use crate::entity::conversation::Message;
 use crate::entity::conversation::MessageType;
 use crate::repositories::conversation;
-use crate::utils::deepgram::speech_to_text;
 use crate::utils::file::save_file;
 use crate::utils::session::send_session_data;
+use crate::utils::whisper::speech_to_text;
 use crate::ServiceState;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use deepgram::speak::options::Container;
+use deepgram::speak::options::Encoding;
+use deepgram::speak::options::Model;
+use deepgram::speak::options::Options;
+use deepgram::Deepgram;
 use http_body_util::StreamBody;
 use hyper::body::{Bytes, Frame};
 use image::ImageFormat;
 use image::ImageReader;
+use regex::Regex;
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::json;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use rs_openai::{
-    chat::{ChatCompletionMessageRequestBuilder, CreateChatRequestBuilder, Role},
-    OpenAI,
-};
+use rs_openai::{chat::Role, OpenAI};
 use sea_orm::TransactionTrait;
-use serde_json::json;
+
 use tokio_stream::StreamExt;
 use tracing::{error, info};
 use uuid::Uuid;
 
-pub async fn save_message(
+#[derive(Debug, Deserialize)]
+pub struct ChatChunkDelta {
+    content: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ChatChunkChoice {
+    delta: ChatChunkDelta,
+    index: usize,
+    finish_reason: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionChunk {
+    id: String,
+    object: String,
+    created: usize,
+    model: String,
+    choices: Vec<ChatChunkChoice>,
+}
+
+pub async fn handle_user_message(
     state: Arc<ServiceState>,
     user_id: i64,
     session_data: Option<SessionData>,
@@ -110,16 +135,14 @@ pub async fn save_message(
             error!("{}", error_message);
             (StatusCode::BAD_REQUEST, error_message)
         })?,
-        _ => speech_to_text(
-            &state.config.deepgram.deepgram_key,
-            message_type.to_language(),
-            message_data.clone(),
-        )
-        .await
-        .map_err(|e| {
-            error!("Speech to text error: {}", e);
-            (StatusCode::BAD_REQUEST, e)
-        })?,
+        _ => {
+            speech_to_text(
+                &state.config.openai.openai_key,
+                message_data.clone(),
+                voice_filename.clone().unwrap(),
+            )
+            .await?
+        }
     };
 
     let transaction = state.db.begin().await.map_err(|e| {
@@ -223,84 +246,190 @@ pub async fn save_message(
             error!("{}", error_message);
             (StatusCode::INTERNAL_SERVER_ERROR, error_message)
         })?;
-        last_user_message_images.push(format!("./public/{}", saved_filename));
+        last_user_message_images.push(saved_filename);
     }
-    conversation_list.push((user_message.clone(), Role::User, last_user_message_images));
+    conversation_list.push((
+        user_message.clone(),
+        Role::User,
+        last_user_message_images.clone(),
+    ));
+    let request_url = "https://api.openai.com/v1/chat/completions";
 
-    let chat_request = CreateChatRequestBuilder::default()
-        .model(message_model)
-        .messages(
-            conversation_list
-                .iter()
-                .enumerate()
-                .map(|(_, &(ref message, ref role, ref images))| {
-                    let mut content_items = vec![json!({
-                        "type": "text",
-                        "text": message.clone()
-                    })];
+    let request_body = json!({
+        "model": message_model,
+        "stream": true,
+        "messages": conversation_list
+        .iter()
+        .map(|&(ref message, ref role, ref images)| {
 
-                    for image in images {
-                        let img = ImageReader::open(image)
-                            .expect("Failed to open image")
-                            .decode()
-                            .expect("Failed to decode image");
-                        let mut jpeg_buffer = Vec::new();
-                        {
-                            let mut cursor = Cursor::new(&mut jpeg_buffer);
-                            img.write_to(&mut cursor, ImageFormat::Jpeg)
-                                .expect("Failed to convert image to JPEG");
-                        }
-                        let base64_string = BASE64_STANDARD.encode(&jpeg_buffer);
-                        content_items.push(json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url" : format!("data:image/jpeg;base64,{}", base64_string)
-                            }
-                        }));
+            let content = if images.is_empty() {
+                json!([{
+                    "type": "text",
+                    "text": message.clone()
+                }])
+            } else {
+                let mut content_items = vec![json!({
+                    "type": "text",
+                    "text": message.clone()
+                })];
+
+                for image in images {
+                    let img = ImageReader::open(format!("./public/{}", image));
+                    if img.is_err() {
+                        continue;
                     }
-                    let content_value = serde_json::Value::Array(content_items);
-                    ChatCompletionMessageRequestBuilder::default()
-                        .role(role.clone())
-                        .content(content_value.to_string())
-                        .build()
-                        .unwrap()
-                })
-                .collect::<Vec<_>>(),
-        )
-        .max_tokens(4098 as u32)
-        .stream(true)
-        .build()
-        .unwrap();
+                    let img = img.unwrap().decode();
+                    if img.is_err() {
+                        continue;
+                    }
+                    let img = img.unwrap().to_rgb8();
+                    let mut jpeg_buffer = Vec::new();
+                    {
+                        let mut cursor = Cursor::new(&mut jpeg_buffer);
+                        if img.write_to(&mut cursor, ImageFormat::Jpeg).is_err() {
+                            continue;
+                        }
+                    }
+                    let base64_string = BASE64_STANDARD.encode(&jpeg_buffer);
+                    content_items.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url" : format!("data:image/jpeg;base64,{}", base64_string)
+                        }
+                    }));
+                }
+                json!(content_items)
+            };
 
-    let mut openai_stream = client
-        .chat()
-        .create_with_stream(&chat_request)
+            json!({
+                "role": role,
+                "content": content
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let client = Client::new();
+    let response = client
+        .post(request_url)
+        .bearer_auth(state.config.openai.openai_key.clone())
+        .json(&request_body)
+        .send()
         .await
         .map_err(|e| {
-            let error_message = format!("OpenAI service error: {}", e);
+            let error_message = format!("OpenAI response failed: {}", e);
             error!("{}", error_message);
             (StatusCode::INTERNAL_SERVER_ERROR, error_message)
         })?;
+    let mut openai_stream = response.bytes_stream();
 
-    let mut content_buffer = vec![];
     let mut total_content = "".to_string();
+    let mut total_voice: Vec<u8> = vec![];
+    let sentence_regex = Regex::new(r"(?m)(?:[.!?]\s+|\n|\r\n)").map_err(|e| {
+        let error_message = format!("Sentence split regex creation failed: {}", e);
+        error!("{}", error_message);
+        (StatusCode::INTERNAL_SERVER_ERROR, error_message)
+    })?;
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, String>>(1000000);
     tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut is_started = false;
         while let Some(response) = openai_stream.next().await {
             match response {
                 Ok(result) => {
-                    for choice in result.choices {
-                        if let Some(content) = choice.delta.content {
-                            let content_clone = content.clone();
-                            content_buffer.push(content.clone());
-                            if tx
-                                .send(Ok(Frame::data(Bytes::from(content_clone))))
-                                .await
-                                .is_err()
-                            {
-                                return Err(());
+                    let s = match std::str::from_utf8(&result) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("Invalid UTF-8 sequence: {}", e);
+                            break;
+                        }
+                    };
+                    let mut cached_str = "".to_string();
+                    for p in s.split("\n") {
+                        match p.strip_prefix("data: ") {
+                            Some(p) => {
+                                if p == "[DONE]" {
+                                    break;
+                                }
+
+                                let d = serde_json::from_str::<ChatCompletionChunk>(&format!(
+                                    "{}{}",
+                                    cached_str, p
+                                ));
+                                if d.is_err() {
+                                    cached_str.push_str(p);
+                                    continue;
+                                }
+                                let d = d.unwrap();
+
+                                let c = d.choices.get(0);
+                                if c.is_none() {
+                                    error!("No choice returned");
+                                    continue;
+                                }
+                                let c = c.unwrap();
+                                cached_str = String::from("");
+
+                                if let Some(content) = &c.delta.content {
+                                    let content_clone = content.clone();
+                                    total_content.push_str(content.clone().as_str());
+                                    match message_type {
+                                        MessageType::Voice => {
+                                            buffer.push_str(&content_clone);
+                                            while let Some(pos) = sentence_regex.find(&buffer) {
+                                                let sentence =
+                                                    buffer.drain(..pos.end()).collect::<String>();
+                                                let dg_client = Deepgram::new(
+                                                    &state.config.deepgram.deepgram_key.clone(),
+                                                );
+                                                if dg_client.is_err() {
+                                                    continue;
+                                                }
+                                                let dg_client = dg_client.unwrap();
+                                                let sample_rate = 16000;
+                                                let channels = 1;
+
+                                                let options = Options::builder()
+                                                    .model(Model::AuraAsteriaEn)
+                                                    .encoding(Encoding::Linear16)
+                                                    .sample_rate(sample_rate)
+                                                    .container(if is_started == false {
+                                                        Container::Wav
+                                                    } else {
+                                                        Container::CustomContainer(
+                                                            "none".to_owned(),
+                                                        )
+                                                    })
+                                                    .build();
+                                                is_started = true;
+                                                let audio_stream = dg_client
+                                                    .text_to_speech()
+                                                    .speak_to_stream(&sentence, &options)
+                                                    .await;
+                                                if audio_stream.is_err() {
+                                                    continue;
+                                                }
+                                                let mut audio_stream = audio_stream.unwrap();
+                                                while let Some(data) = audio_stream.next().await {
+                                                    total_voice.append(&mut data.to_vec());
+                                                    if tx.send(Ok(Frame::data(data))).await.is_err()
+                                                    {
+                                                        return Err(());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        MessageType::Text => {
+                                            if tx
+                                                .send(Ok(Frame::data(Bytes::from(content_clone))))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return Err(());
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            total_content.push_str(content.clone().as_str());
+                            None => {}
                         }
                     }
                 }
@@ -349,7 +478,7 @@ pub async fn save_message(
             } else {
                 Some(user_message)
             },
-            vec![],
+            last_user_message_images,
             total_content,
             if message_id == -1 {
                 (conversation_list.len() - 1) as i64
