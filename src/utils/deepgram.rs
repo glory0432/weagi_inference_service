@@ -1,4 +1,40 @@
+use deepgram::{
+    speak::options::{Container, Encoding, Model, Options},
+    Deepgram,
+};
+use futures::Stream;
+use hyper::body::Bytes;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+pub async fn text_to_speech(
+    api_token: &str,
+    text: &str,
+    is_started: bool,
+) -> Result<impl Stream<Item = Bytes>, String> {
+    let dg_client = Deepgram::new(api_token);
+    if dg_client.is_err() {
+        return Err(format!("Failed to create deepgram client"));
+    }
+    let dg_client = dg_client.unwrap();
+    let sample_rate = 16000;
+    let options = Options::builder()
+        .model(Model::AuraAsteriaEn)
+        .encoding(Encoding::Linear16)
+        .sample_rate(sample_rate)
+        .container(if is_started == false {
+            Container::Wav
+        } else {
+            Container::CustomContainer("none".to_owned())
+        })
+        .build();
+    let audio_stream = dg_client
+        .text_to_speech()
+        .speak_to_stream(text, &options)
+        .await;
+    if audio_stream.is_err() {
+        return Err(format!("Failed to create deepgram response stream"));
+    }
+    Ok(audio_stream.unwrap())
+}
 pub async fn speech_to_text(
     api_token: &str,
     language: &str,

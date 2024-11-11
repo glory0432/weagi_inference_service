@@ -6,6 +6,7 @@ use crate::dto::response::{
 use crate::entity::conversation::Message;
 use crate::repositories::conversation;
 use crate::service::chat::handle_user_message;
+use crate::utils::error::format_error;
 use crate::utils::jwt::UserClaims;
 use crate::ServiceState;
 use axum::{
@@ -27,19 +28,25 @@ where
     F: for<'a> FnOnce(&'a mut sea_orm::DatabaseTransaction) -> BoxFuture<'a, AppResult<T>> + Send,
     T: Send + 'static,
 {
-    let mut transaction = db
-        .begin()
-        .await
-        .map_err(|e| format_error("Starting a database transaction failed", e))?;
+    let mut transaction = db.begin().await.map_err(|e| {
+        format_error(
+            "Starting a database transaction failed",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })?;
 
     let result = operation(&mut transaction).await;
 
     match result {
         Ok(response) => {
-            transaction
-                .commit()
-                .await
-                .map_err(|e| format_error("Committing the database transaction failed", e))?;
+            transaction.commit().await.map_err(|e| {
+                format_error(
+                    "Committing the database transaction failed",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
             Ok(response)
         }
         Err(e) => {
@@ -52,12 +59,6 @@ where
             Err(e)
         }
     }
-}
-
-fn format_error(message: &str, error: impl std::fmt::Display) -> (StatusCode, String) {
-    let error_message = format!("{}: {}", message, error);
-    error!("Error occurred: {}", error_message);
-    (StatusCode::INTERNAL_SERVER_ERROR, error_message)
 }
 
 pub async fn create_new_conversation(
@@ -77,6 +78,7 @@ pub async fn create_new_conversation(
                     format_error(
                         "Failed to create a new conversation due to a database error",
                         e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
                     )
                 })?;
 
@@ -107,6 +109,7 @@ pub async fn retrieve_all_conversations(
                         format_error(
                             "Failed to fetch user's conversations due to a database error",
                             e,
+                            StatusCode::INTERNAL_SERVER_ERROR,
                         )
                     })?
                     .into_iter()
@@ -145,6 +148,7 @@ pub async fn delete_conversation(
                 format_error(
                     "Database query failed while fetching the specified conversation",
                     e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                 )
             })?;
 
@@ -162,6 +166,7 @@ pub async fn delete_conversation(
                     format_error(
                         "Failed to delete the conversation due to a database error",
                         e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
                     )
                 })?;
 
@@ -196,7 +201,11 @@ pub async fn get_conversation(
             )
             .await
             .map_err(|e| {
-                format_error("Error fetching conversation details from the database", e)
+                format_error(
+                    "Error fetching conversation details from the database",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
             })?;
 
             if let Some(model) = conversation_model {
@@ -209,8 +218,13 @@ pub async fn get_conversation(
                     .into_iter()
                     .map(|v| serde_json::from_value::<Message>(v))
                     .collect();
-                let message_result = message_result
-                    .map_err(|e| format_error("Error converting to Message array", e))?;
+                let message_result = message_result.map_err(|e| {
+                    format_error(
+                        "Error converting to Message array",
+                        e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                })?;
                 Ok(Json(GetConversationResponse {
                     messages: message_result,
                 })
@@ -237,39 +251,54 @@ pub async fn send_message(
     let mut images = vec![];
     let mut image_filenames = vec![];
     let mut voice_filename: Option<String> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| format_error("Failed to read multipart fields", e))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        format_error(
+            "Failed to read multipart fields",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })? {
         let name = field.name();
+
         if name.is_none() {
+            error!("Name field is empty");
             continue;
         }
         let filename = field.file_name().map(|s| s.to_string());
         let name = name.unwrap().to_string();
         let data = field.bytes().await;
         if data.is_err() {
+            error!("Data is missing");
             continue;
         }
         let data = data.unwrap();
-
         if name == String::from("message_type") {
-            message_type = String::from_utf8(data.iter().as_slice().to_vec())
-                .map_err(|e| format_error("Error parsing message type as string", e))?;
+            message_type = String::from_utf8(data.iter().as_slice().to_vec()).map_err(|e| {
+                format_error(
+                    "Error parsing message type as string",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
         } else if name == String::from("user_message") {
             message_data = data.iter().as_slice().to_vec();
             voice_filename = filename;
         } else if name == String::from("model_name") {
-            message_model = String::from_utf8(data.iter().as_slice().to_vec())
-                .map_err(|e| format_error("Error parsing message model as string", e))?;
-        } else if name == String::from("images") {
+            message_model = String::from_utf8(data.iter().as_slice().to_vec()).map_err(|e| {
+                format_error(
+                    "Error parsing message model as string",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
+        } else if name == String::from("images[]") {
+            info!("{:?}, {}", filename, data.len());
             image_filenames.push(filename);
             images.push(data.clone());
         }
     }
     if message_type.is_empty() || message_data.is_empty() || message_model.is_empty() {
-        let error_message = format!("Something is missing in the payload: (type existing){}, (data existing){}, (model existing){}", message_type.is_empty(), message_data.is_empty(), message_model.is_empty());
+        let error_message = format!("Something is missing in the payload: (type existing){}, (data existing){}, (model existing){}", !message_type.is_empty(), !message_data.is_empty(), !message_model.is_empty());
         error!("{}", error_message);
         return Err((StatusCode::BAD_REQUEST, error_message));
     }
@@ -307,38 +336,65 @@ pub async fn edit_message(
     let mut images = vec![];
     let mut image_filenames = vec![];
     let mut voice_filename: Option<String> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| format_error("Failed to read multipart fields", e))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        format_error(
+            "Failed to read multipart fields",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })? {
         let name = field.name();
+
         if name.is_none() {
+            error!("Name field is empty");
             continue;
         }
         let filename = field.file_name().map(|s| s.to_string());
         let name = name.unwrap().to_string();
         let data = field.bytes().await;
         if data.is_err() {
+            error!("Data is missing");
             continue;
         }
         let data = data.unwrap();
 
         if name == String::from("message_type") {
-            message_type = String::from_utf8(data.iter().as_slice().to_vec())
-                .map_err(|e| format_error("Error parsing message type as string", e))?;
+            message_type = String::from_utf8(data.iter().as_slice().to_vec()).map_err(|e| {
+                format_error(
+                    "Error parsing message type as string",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
         } else if name == String::from("user_message") {
             message_data = data.iter().as_slice().to_vec();
             voice_filename = filename;
         } else if name == String::from("message_id") {
             message_id = String::from_utf8(data.iter().as_slice().to_vec())
-                .map_err(|e| format_error("Error parsing message id as string", e))?
+                .map_err(|e| {
+                    format_error(
+                        "Error parsing message id as string",
+                        e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                })?
                 .parse::<i64>()
-                .map_err(|e| format_error("Error parsing string as u32", e))?;
+                .map_err(|e| {
+                    format_error(
+                        "Error parsing string as u32",
+                        e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                })?;
         } else if name == String::from("model_name") {
-            message_model = String::from_utf8(data.iter().as_slice().to_vec())
-                .map_err(|e| format_error("Error parsing message model as string", e))?;
-        } else if name == String::from("images") {
+            message_model = String::from_utf8(data.iter().as_slice().to_vec()).map_err(|e| {
+                format_error(
+                    "Error parsing message model as string",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
+        } else if name == String::from("images[]") {
             image_filenames.push(filename);
             images.push(data.clone());
         }
@@ -384,7 +440,11 @@ pub async fn edit_title(
             conversation::edit_title(transaction, user.uid, conversation_id, req.title.clone())
                 .await
                 .map_err(|e| {
-                    format_error("Error updating the conversation title in the database", e)
+                    format_error(
+                        "Error updating the conversation title in the database",
+                        e,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
                 })?;
 
             info!(
